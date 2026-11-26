@@ -1,0 +1,22 @@
+services:
+  # One-off: download SciFact and build the index into the shared volume.
+  ingest:
+    build: .
+    env_file: .env
+    command: python -m ragqa.ingest scifact
+    volumes:
+      - ./data:/app/data
+      - hf-cache:/app/.cache/huggingface
+    profiles: ["ingest"]
+
+  api:
+    build: .
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+      - hf-cache:/app/.cache/huggingface
+    ports:
+      - "8000:8000"
+
+volumes:
+  hf-cache:

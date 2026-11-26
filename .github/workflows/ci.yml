@@ -1,0 +1,114 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      ragas_limit:
+        description: "Number of RAGAS questions (blank = all 300)"
+        required: false
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Lint and unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - run: pip install -r requirements-dev.txt
+      - run: ruff check .
+      - run: pytest -v
+
+  retrieval-eval:
+    name: Retrieval eval (BM25 vs vector vs hybrid)
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - run: pip install -r requirements.txt
+
+      - name: Cache dataset, embedding model and index
+        uses: actions/cache@v4
+        with:
+          path: |
+            data
+            ~/.cache/huggingface
+          key: rag-${{ hashFiles('ragqa/ingest.py', 'ragqa/index.py', 'ragqa/embeddings.py', 'ragqa/config.py') }}
+
+      - name: Build index (SciFact, 5,183 abstracts)
+        run: |
+          if [ ! -f data/index/manifest.json ]; then python -m ragqa.ingest scifact; fi
+
+      - name: Evaluate retrieval and gate on regressions
+        run: python -m eval.retrieval_eval --gate
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: retrieval-results
+          path: results/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: index
+          path: data/
+          retention-days: 1
+
+  ragas-eval:
+    name: RAGAS answer quality gate
+    needs: retrieval-eval
+    runs-on: ubuntu-latest
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+    steps:
+      - name: Skip notice
+        if: env.OPENAI_API_KEY == ''
+        run: echo "::notice::OPENAI_API_KEY secret not set; skipping RAGAS evaluation."
+
+      - uses: actions/checkout@v4
+        if: env.OPENAI_API_KEY != ''
+      - uses: actions/setup-python@v5
+        if: env.OPENAI_API_KEY != ''
+        with:
+          python-version: "3.12"
+          cache: pip
+      - if: env.OPENAI_API_KEY != ''
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements.txt
+      - uses: actions/download-artifact@v4
+        if: env.OPENAI_API_KEY != ''
+        with:
+          name: index
+          path: data/
+      - uses: actions/cache@v4
+        if: env.OPENAI_API_KEY != ''
+        with:
+          path: ~/.cache/huggingface
+          key: rag-${{ hashFiles('ragqa/ingest.py', 'ragqa/index.py', 'ragqa/embeddings.py', 'ragqa/config.py') }}
+
+      - name: Generate answers, score with RAGAS, gate on regressions
+        if: env.OPENAI_API_KEY != ''
+        run: |
+          LIMIT="${{ github.event.inputs.ragas_limit }}"
+          python -m eval.ragas_eval --gate ${LIMIT:+--limit $LIMIT}
+
+      - uses: actions/upload-artifact@v4
+        if: always() && env.OPENAI_API_KEY != ''
+        with:
+          name: ragas-results
+          path: results/

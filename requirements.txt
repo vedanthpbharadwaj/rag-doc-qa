@@ -13,3 +13,5 @@ uvicorn[standard]>=0.29
 pydantic>=2.6
 pydantic-settings>=2.2
 pypdf>=4.0
+
+pyarrow>=15

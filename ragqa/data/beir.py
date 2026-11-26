@@ -13,7 +13,7 @@ Layout on disk (standard BEIR):
 from __future__ import annotations
 
 import csv
-import gzip
+import io
 import json
 import shutil
 import urllib.request
@@ -22,12 +22,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 BEIR_URL = "https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/{name}.zip"
-# Mirror used if the primary server is unavailable.
-HF_FILES = {
-    "corpus.jsonl": "https://huggingface.co/datasets/BeIR/{name}/resolve/main/corpus.jsonl.gz",
-    "queries.jsonl": "https://huggingface.co/datasets/BeIR/{name}/resolve/main/queries.jsonl.gz",
-    "qrels/test.tsv": "https://huggingface.co/datasets/BeIR/{name}-qrels/resolve/main/test.tsv",
+# Hugging Face hosts the same data as Parquet (corpus, queries) plus a separate
+# qrels repo. It is tried first because it is more reliable from CI runners.
+HF_BASE = "https://huggingface.co/datasets/BeIR"
+HF_PARQUET = {
+    "corpus.jsonl": "{base}/{name}/resolve/main/corpus/corpus-00000-of-00001.parquet",
+    "queries.jsonl": "{base}/{name}/resolve/main/queries/queries-00000-of-00001.parquet",
 }
+HF_QRELS = "{base}/{name}-qrels/resolve/main/{split}.tsv"
 
 
 @dataclass
@@ -49,11 +51,18 @@ def download_beir(name: str = "scifact", data_dir: str | Path = "data") -> Path:
         return target
     Path(data_dir).mkdir(parents=True, exist_ok=True)
     try:
-        _download_zip(name, Path(data_dir))
-    except Exception as exc:  # noqa: BLE001 - fall back to the mirror on any failure
-        print(f"Primary download failed ({exc}); trying Hugging Face mirror")
         _download_hf(name, target)
+    except Exception as exc:  # noqa: BLE001 - fall back to the original server on any failure
+        print(f"Hugging Face download failed ({exc}); trying the BEIR server")
+        shutil.rmtree(target, ignore_errors=True)
+        _download_zip(name, Path(data_dir))
     return target
+
+
+def _fetch(url: str) -> bytes:
+    print(f"Downloading {url}")
+    with urllib.request.urlopen(url, timeout=120) as resp:
+        return resp.read()
 
 
 def _download_zip(name: str, data_dir: Path) -> None:
@@ -68,15 +77,29 @@ def _download_zip(name: str, data_dir: Path) -> None:
 
 
 def _download_hf(name: str, target: Path) -> None:
-    for rel, url in HF_FILES.items():
-        dest = target / rel
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        print(f"Downloading {url.format(name=name)}")
-        with urllib.request.urlopen(url.format(name=name), timeout=120) as resp:
-            data = resp.read()
-        if url.endswith(".gz"):
-            data = gzip.decompress(data)
-        dest.write_bytes(data)
+    import pyarrow.parquet as pq  # installed via ragas -> datasets
+
+    target.mkdir(parents=True, exist_ok=True)
+    for filename, url in HF_PARQUET.items():
+        table = pq.read_table(io.BytesIO(_fetch(url.format(base=HF_BASE, name=name))))
+        with open(target / filename, "w", encoding="utf-8") as fh:
+            for row in table.to_pylist():
+                record = {
+                    "_id": str(row["_id"]),
+                    "title": row.get("title") or "",
+                    "text": row.get("text") or "",
+                }
+                fh.write(json.dumps(record) + "\n")
+
+    qrels_dir = target / "qrels"
+    qrels_dir.mkdir(parents=True, exist_ok=True)
+    for split in ("test", "train"):
+        url = HF_QRELS.format(base=HF_BASE, name=name, split=split)
+        try:
+            (qrels_dir / f"{split}.tsv").write_bytes(_fetch(url))
+        except Exception:  # noqa: BLE001 - only the test split is required
+            if split == "test":
+                raise
 
 
 def load_beir(path: str | Path, split: str = "test") -> BeirDataset:

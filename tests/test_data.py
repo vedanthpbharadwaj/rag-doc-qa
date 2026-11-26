@@ -25,31 +25,51 @@ def test_documents_from_directory(tmp_path):
     assert sorted(d.metadata["doc_id"] for d in docs) == ["b.txt", "notes/a.md"]
 
 
-def test_download_falls_back_to_mirror(tmp_path, monkeypatch):
-    import gzip
+def _jsonl_to_parquet(path):
+    import io
+    import json
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    rows = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            row = json.loads(line)
+            rows.append({"_id": str(row["_id"]), "title": row.get("title", ""), "text": row.get("text", "")})
+    buf = io.BytesIO()
+    pq.write_table(pa.Table.from_pylist(rows), buf)
+    return buf.getvalue()
+
+
+def test_download_from_hugging_face_parquet(tmp_path, monkeypatch):
     import io
 
     from ragqa.data import beir
 
     fixture = beir.Path(__file__).parent / "fixtures" / "beir_mini"
     payloads = {
-        "corpus.jsonl.gz": gzip.compress((fixture / "corpus.jsonl").read_bytes()),
-        "queries.jsonl.gz": gzip.compress((fixture / "queries.jsonl").read_bytes()),
+        "corpus-00000-of-00001.parquet": _jsonl_to_parquet(fixture / "corpus.jsonl"),
+        "queries-00000-of-00001.parquet": _jsonl_to_parquet(fixture / "queries.jsonl"),
         "test.tsv": (fixture / "qrels" / "test.tsv").read_bytes(),
     }
 
     def fake_urlopen(url, timeout=None):
         if url.endswith(".zip"):
-            raise OSError("primary down")
-        return io.BytesIO(payloads[url.rsplit("/", 1)[-1]])
+            raise AssertionError("BEIR server should not be needed when Hugging Face works")
+        name = url.rsplit("/", 1)[-1]
+        if name not in payloads:
+            raise OSError(f"404 Not Found: {name}")
+        return io.BytesIO(payloads[name])
 
     monkeypatch.setattr(beir.urllib.request, "urlopen", fake_urlopen)
     path = beir.download_beir("scifact", tmp_path)
     ds = beir.load_beir(path)
     assert len(ds.corpus) == 12 and len(ds.test_queries) == 4
+    assert ds.qrels["2"] == {"103": 1}
 
 
-def test_download_from_primary_zip(tmp_path, monkeypatch):
+def test_download_falls_back_to_zip(tmp_path, monkeypatch):
     import io
     import zipfile
 
@@ -60,7 +80,13 @@ def test_download_from_primary_zip(tmp_path, monkeypatch):
     with zipfile.ZipFile(buf, "w") as zf:
         for rel in ("corpus.jsonl", "queries.jsonl", "qrels/test.tsv"):
             zf.write(fixture / rel, f"scifact/{rel}")
-    monkeypatch.setattr(beir.urllib.request, "urlopen", lambda url, timeout=None: io.BytesIO(buf.getvalue()))
+
+    def fake_urlopen(url, timeout=None):
+        if not url.endswith(".zip"):
+            raise OSError("Hugging Face down")
+        return io.BytesIO(buf.getvalue())
+
+    monkeypatch.setattr(beir.urllib.request, "urlopen", fake_urlopen)
     ds = beir.load_beir(beir.download_beir("scifact", tmp_path))
     assert len(ds.queries) == 5
     assert not (tmp_path / "scifact.zip").exists()
